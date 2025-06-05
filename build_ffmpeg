@@ -1,0 +1,1107 @@
+#!/bin/bash
+exec > >(tee -a ffmpeg_build.log) 2>&1
+our_logfile=ffmpeg_build.log
+[ -f $our_logfile ] && rm $our_logfile
+script_start=$(date +%s.%N)
+# set -x
+# This script is based on
+#
+# from https://trac.ffmpeg.org/wiki/CompilationGuide/Ubuntu
+#
+# The following comment are distilled from that file:
+#
+# Compile FFmpeg for Ubuntu, Debian, or Mint
+#
+# This guide for standard current releases of Ubuntu and Debian. It will provide a local,
+# non-system installation of FFmpeg with several external libraries.
+#
+# Note: FFmpeg is part of the Ubuntu packages and can be installed via apt-get install ffmpeg. You may still wish to compile if you want the latest version, experience a bug, or want to customize your build, and it will not interfere with the ffmpeg package in the repository.
+##    Tags
+#    configuration
+#
+# This guide is designed to be non-intrusive and will create several directories in your home directory:
+# AND this script
+#
+#    ffmpeg_sources – Where the source files will be downloaded. This can be deleted if desired when finished with the guide.
+#    ffmpeg_build – Where the files will be built and libraries installed. This can be deleted if desired when finished with the guide.
+#    bin – Where the resulting binaries (ffmpeg, ffplay, ffprobe, x264, x265) will be installed.
+# --------------------------------------------------------------------------------------------------
+
+ffmpeg_bin=~/bin  # Created if it doesnt exist!  # default= ffmpeg_bin=~/bin
+# The following folders can be deleted after a successful install.
+ffmpeg_build_root=~/ffmpeg # Created if it doesnt exist!  Where the source files will be downloaded -
+
+# remove the _disabled from the following if you want to compile from a ram disk
+# its good solution if you have encrypted disks and building/compilation problems
+# and it can speed the process up a little - I disabled it while I was testing so that things were the same between reboots
+if [ -d /dev/shm_disabled ] ; then   # Under non-minimalist debian based distributions /dev/shm should be avaialable
+  ffmpeg_sources=/dev/shm/$(whoami)/ffmpeg/sources # Where the source files will be downloaded If /dev/shm is available
+  ffmpeg_build=/dev/shm/$(whoami)/ffmpeg/build # Where the source files will be downloaded If /dev/shm is available
+else
+  ffmpeg_sources=${ffmpeg_build_root}/sources # Where any source archives or git clones will be put for compilation
+  ffmpeg_build=${ffmpeg_build_root}/build # Where the files will be built and libraries installed. This can be deleted if desired when finished with the guide.
+fi
+# ffmpeg_sources & ffmpeg_build are Created if they dont exist!
+
+
+# This script will present you with the following option if it finds the folder structure
+#             "Clean up the source build area (start from scratch)?"
+# Simply choose Y(es) and everything will be cleaned up with
+# the exception of the binaries in ffmpeg_bin
+# At the next prompt following cleanup simply choose C cancel to bail out of the script
+
+JM="-j $(($(nproc) + 1))" # Note: The default for make: Allow N jobs at once; infinite jobs with no arg
+                          #       The default for ninja: run N jobs in parallel (0 means infinity) [default=6 on this system]
+                          # So: Effectively the same
+
+# unset JM                  # set this back to default - Comment this line out if you want to reduce cpu usage
+
+CUDA_BINDIR=""    # This variable will hold the location of nvcc
+
+FFCONFIG_ARGS=""  # This variable will hold all the config args passed to ffmpegs configure
+SEL_ACTION=""     # This reponse-driven script will hold the users last chosen response
+
+# I had a promblem with PYTHONUSERBASE
+# python couldnt import cmake bacause PYTHONUSERBASE was pointing to a non-existant folder.
+# The physical disk it was on had died years ago and I forgot the variable was set
+[ -d "${PYTHONUSERBASE}" ] || unset PYTHONUSERBASE
+
+SIMULATE="True"   # This allows the configure args to be set for all the steps
+unset SIMULATE    # with the without actually downloading or compiliing
+                  # usefull when all you want to do is recompile ffmpeg
+
+
+quiet=1
+set_quiet(){
+  quiet=0
+}
+
+set_sudo(){
+  # this will just cache make anything
+  # it will time out after whatever setting is in
+  # /etc/sudoers :Defaults timestamp_timeout=<time-in-minutes>
+ sudo echo "sudo is on"
+}
+
+Player=$(which aplay)
+
+beep(){
+  [ $quiet -eq 0 ] && return
+  if [ "${Player}" != "" ]
+  then
+    if [ "${1}" == "" ]; then
+      $Player "${ffmpeg_build_root}/info.wav" > /dev/null 2>&1 &
+    else
+      $Player "${ffmpeg_build_root}/${1}.wav" > /dev/null 2>&1 &
+    fi
+  fi
+}
+
+beep_error(){
+  beep 'error'
+}
+
+
+bailout(){  #simple error handler - this gets called. This is not a trap
+  echo -e "\n${1}\nSo quitting..."
+  show_exec_time
+  Show_Configure
+  beep_error
+  exit 1
+}
+
+cleanup(){
+  rm -rf ${ffmpeg_build} ${ffmpeg_sources} ${ffmpeg_bin}/{ffmpeg,ffprobe,ffplay,x264,x265,nasm}
+  # ^^ if you want to delete the binaries as well
+  rm -rf ${ffmpeg_build} ${ffmpeg_sources}
+}
+
+mkdirs(){
+  mkdir -p ${ffmpeg_sources} ${ffmpeg_bin} ${ffmpeg_build}
+}
+
+# set PATH so it includes user's private dirs if they exist
+checkPATH(){ # Borrowed from ~/.bashrc
+  SUB="${1}"
+  if [ -d "$SUB" ] ; then
+      if [[ "$PATH" != *"$SUB"* ]]; then
+        PATH="$SUB:$PATH"
+        # echo -e "Adding $SUB in front of PATH"
+        # echo -e "NEW PATH=$PATH"
+      # else
+      #   echo -e "$SUB already in PATH"
+      fi
+  fi
+}
+
+show_exec_time(){
+  script_end=$(date +%s.%N)
+  duration=$( echo "$script_end - $script_start" | bc -l )
+  duration=$(printf "%.0f\n" "${duration}" )
+  duration=$(printf '%02dh:%02dm:%02ds\n' $((duration/3600)) $((duration%3600/60)) $((duration%60)))
+  echo "Script took ${duration}"
+}
+
+
+# Add configure options to the FFCONFIG_ARGS variable
+addFFConfigArgs(){ # Idea Borrowed from ~/.bashrc
+  for cfgarg in "$@"
+  do
+    if [[ "$FFCONFIG_ARGS" != *"$cfgarg"* ]]; then
+      if [ -z "${FFCONFIG_ARGS}" ]
+      then
+        FFCONFIG_ARGS="${cfgarg}"
+      else
+        FFCONFIG_ARGS="$FFCONFIG_ARGS ${cfgarg// /}" #Tack them on the end
+      fi
+    fi
+  done
+}
+
+Show_Configure(){
+  echo -e "\n\nVariables set:"
+  echo -e "NVSMI            = $NVSMI :\tnvidia-smi location"
+  echo -e "CUDA_VERSION     = $CUDA_VERSION :\tThe maximum version of CUDA toolkit supported by the current driver"
+  echo -e "CTVSD            = $CTVSD :\tThis is a modified copy of CUDA_VERSION"
+  echo -e "CTVL             = $CTVL  :\tThis is a modified copy of CUDA_VERSION"
+  echo -e "CUDA_DIR         = $CUDA_DIR :\tThe location of the CUDA dir"
+  echo -e "CUDA_BINDIR      = $CUDA_BINDIR :\tThe location of the CUDA binaries dir"
+  echo -e "NV_CODEC_BRANCH  = $NV_CODEC_BRANCH :\tThis is the branch of nv_codec_headers that matches CUDA_VERSION"
+  echo -e "NVGPU_GENCODE    = $NVGPU_GENCODE \t Tell ffmpegs build process what gencode of gpu youre compiling for"
+  echo -e "------------------"
+  echo -e "GPP_VERSION      = $GPP_VERSION :\tA pared down version of the g++ compiler version"
+  echo -e "CFLAGS           = $CFLAGS     : --\ "
+  echo -e "CXXFLAGS         = $CXXFLAGS   : ---]-Performance flags for compilation and linking"
+  echo -e "LDFLAGS          = $LDFLAGS    : --/ "
+  echo -e "CC               = $CC  compiler"
+  echo -e "CXX              = $CXX compiler"
+  echo -e "CMFLAGS          = $CMFLAGS - speed up compilation by not compiling examples and docs etc"
+  echo -e "------------------"
+  echo -e "LD_LIBRARY_PATH  = $LD_LIBRARY_PATH"
+  echo -e "PKG_CONFIG_PATH  = $PKG_CONFIG_PATH"
+  echo -e "PATH             = $PATH"
+  echo -e "------------------"
+  echo -e "ffmpeg_sources   = $ffmpeg_sources"
+  echo -e "ffmpeg_bin       = $ffmpeg_bin"
+  echo -e "ffmpeg_build     = $ffmpeg_build"
+  echo -e "------------------"
+}
+# Set up all the variables we need to get the correct versions of things
+# Also creates all the folders IF they dont already exist
+Do_Configure(){
+
+  NVSMI=$(which nvidia-smi)
+
+  [ -f "${NVSMI}" ] || bailout "nvidia-smi not found"
+
+  CUDA_VERSION=$(nvidia-smi --version | grep CUDA | tr -s ' ' | cut -d: -f2-) #extract cuda version and squeeze out duplicate spaces
+  # CUDA_VERSION=$(nvidia-smi --version | grep CUDA  | cut -d: -f2-) #extract cuda version and squeeze out duplicate spaces
+  CUDA_VERSION="${CUDA_VERSION// /}" #strip all spaces
+  [[ $CUDA_VERSION != *.* ]] && CUDA_VERSION="${CUDA_VERSION}.0" # add dot zero if it doesnt have a dot ie: turn 10 into 10.0
+  CTVSD=${CUDA_VERSION//./-} # create two part dashed version ie 12-8
+  [[ $CUDA_VERSION != *.*.* ]] && CTVL="${CUDA_VERSION}.0" || CTVL="${CUDA_VERSION}" # construct a three part version number ie 12.8.0
+  # CTVLD=${CTVL//./-} # create three part dashed version ie 12-8-0
+
+  CUDA_DIR="/usr/local/cuda-${CUDA_VERSION}" #/usr/local/cuda-12.9/bin
+  CUDA_BINDIR="${CUDA_DIR}/bin" #/usr/local/cuda-12.9/bin
+
+  # figure out the highest version of the nv-codec-headers that will work with our CUDA_VERSION
+  # Get all tags, remove 'n' prefix if present, and sort them
+  TAGS=$(git ls-remote --tags https://github.com/FFmpeg/nv-codec-headers.git | \
+      awk '{print $2}' | sed 's|refs/tags/||' | grep -E '^n?[0-9]+\.[0-9]+' | sed 's/^n//' | sort -V)
+  # Find the highest tag <= CUDA_VERSION
+  NV_CODEC_HEAD_TAG=$(echo "$TAGS" | awk -v ver="$CUDA_VERSION" '
+      {
+          split($1, t, ".")
+          split(ver, v, ".")
+          if (t[1] < v[1] || (t[1] == v[1] && t[2] <= v[2])) {
+              print $1
+          }
+      }' | tail -n1)
+
+  # [ -z "${SIMULATE}" ] && return # onCUDA_VERSIONly do the rest if simulate is set
+
+
+  NV_CODEC_BRANCH=sdk/$(echo $NV_CODEC_HEAD_TAG | cut -d. -f1-2) # we should have something like sdk/12.2
+
+  checkPATH "${CUDA_BINDIR}"
+  LD_LIBRARY_PATH="${CUDA_BINDIR}"/lib64:$LD_LIBRARY_PATH
+  # export PATH="${CUDA_BINDIR}":$PATH
+  # export LD_LIBRARY_PATH="${CUDA_BINDIR}"/lib64:$LD_LIBRARY_PATH
+
+  NVGPU_GENCODE=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader)
+  NVGPU_GENCODE="${NVGPU_GENCODE//./}"
+
+  # GPP_VERSION=$(g++ --version | grep "g++" | cut -d\) -f2 | tr -s ' ')
+  #
+  # I had wanted to do this automatically for the default version but the cuda toolkit
+  # was built with 12 and my system default was 11 - this  broke the final linking stage
+  # fyi from config.log :
+  # lto1: fatal error: bytecode stream in file '/tmp/ffconf.yDy4x9mi/test.o'
+  # generated with LTO version 12.0 instead of the expected 11.3
+  # compilation terminated.
+  #
+  GPP_VERSION=12
+  GPP_VERSION=${GPP_VERSION%%.*} # we need this for : --nvccflags="-ccbin=/usr/bin/g++-${GPP_VERSION}"
+  GPP_VERSION=${GPP_VERSION// /}
+
+  # export CFLAGS="-O2 -flto=auto"
+  # export CXXFLAGS="-O2 -flto=auto"
+  # export LDFLAGS="-flto=auto"
+  export CC="$(which gcc-${GPP_VERSION})"
+  export CXX="$(which g++-${GPP_VERSION})"
+
+  CMFLAGS="-DBUILD_EXAMPLES=OFF"            #self explanitory
+  CMFLAGS="$CMFLAGS -DBUILD_TESTS=OFF"      # ""      ""
+  CMFLAGS="$CMFLAGS -DBUILD_DOCS=OFF"       # ""      ""
+  CMFLAGS="$CMFLAGS -DENABLE_CCACHE=1"      # cache sucessfully compiled objects
+  CMFLAGS="$CMFLAGS -DENABLE_LTO=0"         # disable resource hungry link time optimisation
+  # libaom has different options - cmake should ignore options it doesnt understand
+  CMFLAGS="$CMFLAGS -DENABLE_TESTS=0"
+  CMFLAGS="$CMFLAGS -DENABLE_TOOLS=0"
+  CMFLAGS="$CMFLAGS -DENABLE_EXAMPLES=0"
+
+  mkdir -p ${ffmpeg_sources} ${ffmpeg_bin} ${ffmpeg_build}
+  ffmpeg_sources=$(cd "${ffmpeg_sources}"; pwd) # Personal. For me this location is a symlink to a fas dev drive
+  ffmpeg_bin=$(cd ${ffmpeg_bin} ; pwd)  # Personal. For me this location is a symlink to a fas dev drive
+  ffmpeg_build=$(cd ${ffmpeg_build} ; pwd)
+  [ -z $PKG_CONFIG_PATH ] && PKG_CONFIG_PATH=${ffmpeg_sources}/lib/pkgconfig || \
+                             PKG_CONFIG_PATH=${ffmpeg_sources}/lib/pkgconfig:$PKG_CONFIG_PATH
+  export PKG_CONFIG_PATH
+  # export PKG_CONFIG_PATH="${ffmpeg_sources}/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}"
+  # Show_Configure
+}
+
+cudatoolkit(){  # Install a cuda toolkit that matches our current drivers maximum supported version
+
+  NVCC="${CUDA_BINDIR}/nvcc"
+
+  # Just checking for nvcc is wrong. It might be the wrong version
+  #
+  # if [ -f "${NVCC}" ]; then # If nvcc is there we *should
+  #   echo "NVVC Found! Looks like the cuda toolkit package is already installed"
+  #   checkPATH "${CUDA_BINDIR}"
+  #   return
+  # fi
+
+  CUDATK=$(dpkg -l | grep -i "cuda-toolkit-$CTVSD")  # is the correct cuda toolkit installed?
+  if [ "${CUDATK}" != "" ]; then  # if no :go and get it
+    sudo apt-get -y --reinstall install cuda-toolkit-"${CTVSD}"
+    if [ -f "${NVCC}" ]
+    then
+      echo "NVVC Installed with: apt-get -y install cuda-toolkit-${CTVSD}"
+      checkPATH "${CUDA_BINDIR}"
+      return
+    fi
+  fi
+  [ -z "${SIMULATE}" ] || return
+
+  echo "Installing The Cuda Toolkit $CTVL .."
+  CUDAKEYRING=$(dpkg -l | grep -i "cuda-keyring_1.1-1")  # is the correct cuda keyring installed?
+  if [ "${CUDAKEYRING}" != "" ]; then  # if no :go and get it
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+    sudo dpkg -i cuda-keyring_1.1-1_all.deb || bailout "Failed installing Cuda toolkit keyring"
+    [ -f cuda-keyring_1.1-1_all.deb ] && rm -v  cuda-keyring_1.1-1_all.deb
+  fi
+  sudo apt-get update
+  sudo apt-get install -y cuda-toolkit-"${CTVSD}"
+
+  if [ -f "${NVCC}" ]; then
+    echo "Cuda Toolkit installed"
+    echo "NVVC Installed: ${CUDA_BINDIR}"
+    checkPATH "${CUDA_BINDIR}"
+  else
+    bailout "Failed installing Cuda toolkit and nvcc $NVCC"
+  fi
+}
+
+# These are packages required for compiling, but you can
+# remove them when you are done if you prefer:
+deps(){
+  SECONDS=0
+  [ -z "${SIMULATE}" ] || return
+  echo -e "\nInstalling Dependancies"
+  sudo apt-get update -qq && \
+  sudo apt-get -y install \
+    autoconf \
+    automake \
+    build-essential \
+    cmake \
+    git-core \
+    libass-dev \
+    libfreetype6-dev \
+    libgnutls28-dev \
+    libmp3lame-dev \
+    libsdl2-dev \
+    libtool \
+    libva-dev \
+    libvdpau-dev \
+    libvorbis-dev \
+    libxcb1-dev \
+    libxcb-shm0-dev \
+    libxcb-xfixes0-dev \
+    meson \
+    ninja-build \
+    pkg-config \
+    texinfo \
+    wget \
+    yasm \
+    zlib1g-dev
+
+    # libdav1d needs this
+    sudo apt-get -y install python3-pip && \
+    pip3 install --user meson
+
+    # Ensure prerequisite libraries (e.g., libgmp-dev, libmpc-dev) are
+    # installed to avoid fallback to GCC 11 during dependency checks
+    sudo apt-get install libmpfr-dev libmpc-dev libgmp-dev
+
+  # sudo apt-get install checkinstall  # not used - for replacing anything that has a "sudo make install"
+
+  # On Ubuntu 20.04 you may also need this :
+  # (​note: https://askubuntu.com/questions/1252997/unable-to-compile-ffmpeg-on-ubuntu-20-04)
+  sudo apt-get install libunistring-dev libaom-dev libdav1d-dev
+
+  # Additional stuff you may not need
+  sudo apt-get install \
+    tcsh \
+    zlib1g-dev \
+    libtool \
+    libc6 \
+    libc6-dev \
+    unzip \
+    git-core \
+    texinfo
+
+
+  # Additional dev packages you may not need
+  sudo apt-get -y install \
+    libnuma1 \
+    libnuma-dev \
+    libass-dev \
+    libfreetype6-dev \
+    libgnutls28-dev \
+    libsdl2-dev \
+    libva-dev \
+    libvdpau-dev \
+    libvorbis-dev \
+    libxcb1-dev \
+    libxcb-shm0-dev \
+    libxcb-xfixes0-dev \
+    libffmpeg-nvenc-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavdevice-dev \
+    libavfilter-dev
+
+    # just to make sure
+    pip install --user cmake
+
+    cudatoolkit  #Installing the cudo toolkit is a part of preparing dependacies
+
+    echo "Elapsed Time: $SECONDS seconds"
+}
+
+
+
+
+assembler(){
+# An assembler used by some libraries.
+#
+# If your repository provides nasm version ≥ 2.14 then you can install that instead of compiling:
+# nasm7
+  [ -z "${SIMULATE}" ] || return
+  cd "${ffmpeg_sources}" && \
+  # wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.bz2
+  # tar xjvf nasm-2.16.03.tar.bz2
+  # its cleaner and faster using git
+  git -C nasm-2.16.03 pull 2> /dev/null || \
+  git clone --depth 1 --branch nasm-2.16.03  https://github.com/netwide-assembler/nasm.git nasm-2.16.03 && \
+  cd nasm-2.16.03 && \
+  touch nasm.1 && \
+  touch ndisasm.1 && \
+  SECONDS=0 && \
+  ./autogen.sh && \
+  PATH="${ffmpeg_bin}:$PATH" ./configure --prefix="${ffmpeg_build}" --bindir="${ffmpeg_bin}" && \
+  make $JM && \
+  make install && echo -e "\nDone\n" || bailout "nasm compile failed"
+  echo "Nasm Build took: $SECONDS seconds"
+  beep
+}
+
+
+use_ffnvcodec(){
+  # NVENC
+  #
+  # NVENC can be used for H.264 and HEVC encoding.
+  # FFmpeg supports NVENC through the h264_nvenc and hevc_nvenc encoders.
+  # In order to enable it in FFmpeg you need:
+  #
+  #     A ​supported GPU
+  #     Supported drivers for your operating system
+  #     ​The NVIDIA Codec SDK or compiling FFmpeg with --enable-cuda-llvm
+  #     ffmpeg configured with --enable-ffnvcodec (default if the nv-codec-headers are detected while configuring)
+  #
+  # Note: FFmpeg uses its own slightly modified runtime-loader for NVIDIA's CUDA/NVENC/NVDEC-related libraries.
+  # If you get an error from configure complaining about missing ffnvcodec, ​this project is what you need.
+  # It has a working Makefile with an install target: make install PREFIX=/usr.
+  # FFmpeg will look for its pkg-config file, called ffnvcodec.pc. Make sure it is in your PKG_CONFIG_PATH.
+
+  # Do_Configure
+  # these are in the same order as the example at:
+  # https://docs.nvidia.com/video-technologies/video-codec-sdk/11.1/ffmpeg-with-nvidia-gpu/index.html
+  # addFFConfigArgs  --enable-scale-cuda
+  addFFConfigArgs  --enable-cuda-nvcc
+  addFFConfigArgs  --enable-libnpp
+  addFFConfigArgs  --enable-cuda-llvm
+  addFFConfigArgs  --enable-nonfree
+  addFFConfigArgs  --enable-ffnvcodec
+  addFFConfigArgs  --enable-cuvid
+  addFFConfigArgs  --enable-cuda
+  addFFConfigArgs  --enable-nvdec
+  addFFConfigArgs  --extra-cflags=-I"${CUDA_DIR}"/include
+  addFFConfigArgs  --extra-ldflags=-L"${CUDA_DIR}"/lib64
+  # addFFConfigArgs  --disable-static --enable-shared
+  [ -z "${SIMULATE}" ] || return
+
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}"
+  git -C nv-codec-headers pull 2> /dev/null ||  \
+  git clone --branch ${NV_CODEC_BRANCH} --single-branch \
+      https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
+  cd nv-codec-headers && \
+  SECONDS=0 && \
+  make $JM && \
+  sudo make install && echo -e "\nDone\n" || bailout "ffnvcodec compile failed"
+  echo "nv-codec-headers Build took: $SECONDS seconds"
+  beep
+}
+
+
+use_libx264(){
+# libx264
+#
+# H.264 video encoder. See the H.264 Encoding Guide for more information and usage examples.
+#
+# Requires ffmpeg to be configured with --enable-gpl --enable-libx264.
+  addFFConfigArgs --enable-gpl --enable-libx264
+
+  [ -z "${SIMULATE}" ] || return
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C x264 pull 2> /dev/null || git clone  --depth 1 https://code.videolan.org/videolan/x264.git && \
+  SECONDS=0 && \
+  cd x264 && \
+  PATH="${ffmpeg_bin}:$PATH" PKG_CONFIG_PATH="${ffmpeg_sources}/lib/pkgconfig" ./configure --prefix="${ffmpeg_build}" --bindir="${ffmpeg_bin}" --enable-static --enable-pic && \
+  PATH="${ffmpeg_bin}:$PATH" make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libx264 compile failed"
+  echo "libx264 Build took: $SECONDS seconds"
+  beep
+}
+
+use_libx265(){
+
+  # libx265
+  #
+  # H.265/HEVC video encoder. See the H.265 Encoding Guide for more information and usage examples.
+  #
+  # Requires ffmpeg to be configured with --enable-gpl --enable-libx265.
+  addFFConfigArgs --enable-gpl --enable-libx265
+
+  [ -z "${SIMULATE}" ] || return
+  multi_path="multicoreware*"
+  # sudo apt-get -y install libnuma-dev cmake && \ # << These are alrady install in deps()
+  cd "${ffmpeg_sources}"
+  if compgen -G "${multi_path}" > /dev/null; then
+    rm -rfv multicoreware*
+  fi
+  wget -O x265.tar.bz2 https://bitbucket.org/multicoreware/x265_git/get/master.tar.bz2 && \
+  tar xjvf x265.tar.bz2 && \
+  SECONDS=0 && \
+  cd multicoreware*/build/linux  && \
+  SECONDS=0 && \
+  PATH="${ffmpeg_bin}:$PATH" cmake -G "Unix Makefiles" \
+        $CMFLAGS \
+        -DCMAKE_INSTALL_PREFIX="${ffmpeg_sources}" \
+        -DENABLE_SHARED=off \
+         ../../source && \
+  PATH="${ffmpeg_bin}:$PATH" make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libx265 compile failed"
+  echo "libx265 Build took: $SECONDS seconds"
+  beep
+}
+
+
+use_libvpx(){
+# libvpx
+#
+# VP8/VP9 video encoder/decoder. See the VP9 Video Encoding Guide for more information and usage examples.
+#
+# Requires ffmpeg to be configured with --enable-libvpx.
+  # FFCONFIG_ARGS="${FFCONFIG_ARGS} --enable-libvpx"
+  addFFConfigArgs --enable-libvpx
+
+  [ -z "${SIMULATE}" ] || return
+
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C libvpx pull 2> /dev/null || git clone  --depth 1 https://chromium.googlesource.com/webm/libvpx.git && \
+  cd libvpx && \
+  SECONDS=0 && \
+  PATH="${ffmpeg_bin}:$PATH" ./configure --prefix="$arball{ffmpeg_build}" --disable-examples --disable-unit-tests --enable-vp9-highbitdepth --as=yasm && \
+  PATH="${ffmpeg_bin}:$PATH" make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libvpx compile failed"
+  echo "libpvx Build took: $SECONDS seconds"
+  beep
+}
+
+use_libfdk_aac(){
+# libfdk-aac
+#
+# AAC audio encoder. See the AAC Audio Encoding Guide for more information and usage examples.
+#arball
+# Requires ffmpeg to be configured with --enable-libfdk-aac (and --enable-nonfree if you also included --enable-gpl).
+# ----------------------------------------------------------------------
+# You may see the following flash up in your terminal
+# I've pasted it here so you can do whever is required
+#
+# Libraries have been installed in:
+#    'Your ${ffmpeg_build}'/libarball
+#
+# If you ever happen to want to link against installed libraries
+# in a given directory, LIBDIR, you must either use libtool, and
+# specify the full pathname of the library, or use arballthe '-LLIBDIR'
+# flag during linking and do at least one of the following:
+#    - add LIBDIR to the 'LD_LIBRARY_PATH' environment variable
+#      during execution
+#    - add LIBDIR to the 'LD_RUN_PATH' environment variable
+#      during linking
+#    - use the '-Wl,-rpath -Wl,LIBDIR' linker flag
+#    - have your system administrator add LIBDIR to '/etc/ld.so.conf'
+#
+# See any operating system documentation about shared libraries for
+# more information, such as the ld(1) and ld.so(8) manual pages.
+# ----------------------------------------------------------------------
+# Requires ffmpeg to be configured with --enable-libfdk-aac (and --enable-nonfree if you also included --enable-gpl).
+
+  addFFConfigArgs --enable-gpl --enable-nonfree --enable-libfdk-aac
+
+  [ -z "${SIMULATE}" ] || return
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C fdk-aac pull 2> /dev/null || git clone  --depth 1 https://github.com/mstorsjo/fdk-aac && \
+  cd fdk-aac && \
+  SECONDS=0 && \
+  autoreconf -fiv && \
+  ./configure --prefix="${ffmpeg_build}" --disable-shared && \
+  make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libfdk-aac compile failed"
+  echo "libfdk-aac Build took: $SECONDS seconds"
+  beep
+}
+
+use_libopus(){
+  # libopus
+  #
+  # Opus audio decoder and encoder.
+  #
+  # Requires ffmpeg to be configured with --enable-libopus.
+  #
+  addFFConfigArgs --enable-libopus
+  [ -z "${SIMULATE}" ] || return
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C opus pull 2> /dev/null || git clone  --depth 1 https://github.com/xiph/opus.git && \
+  cd opus && \
+  SECONDS=0 && \
+  ./autogen.sh && \
+  ./configure --prefix="${ffmpeg_build}" --disable-shared && \
+  make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libopus compile failed"
+  echo "libopus Build took: $SECONDS seconds"
+  beep
+}
+
+use_libaom(){
+  # libaom
+  #
+  # AV1 video encoder/decoder:
+  # Requires ffmpeg to be configured with --enable-libaom.
+  addFFConfigArgs --enable-libaom
+
+  [ -z "${SIMULATE}" ] || return
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C aom pull 2> /dev/null || git clone  --depth 1 https://aomedia.googlesource.com/aom && \
+  mkdir -p aom_build && \
+  cd aom_build && \
+  SECONDS=0 && \
+  PATH="${ffmpeg_bin}:$PATH" cmake -G "Unix Makefiles" \
+      -DCMAKE_INSTALL_PREFIX="${ffmpeg_sources}" \
+      $CMFLAGS -DENABLE_NASM=on ../aom && \
+  PATH="${ffmpeg_bin}:$PATH" make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libaom compile failed"
+  echo "libaom Build took: $SECONDS seconds"
+}
+
+use_libsvtav1_old(){
+  # libsvtav1
+  #
+  # AV1 video encoder/decoder. Only the encoder is supported by FFmpeg, so building of the decoder is disabled.
+  #
+  # Requires ffmpeg to be configured with --enable-libsvtav1.
+
+  # Deal With This error
+  # collect2: error: ld returned 1 exit status
+  # make[2]: *** [Source/App/CMakeFiles/SvtAv1EncApp.dir/build.make:204: /home/martin/ffmpeg/sources/SVT-AV1/Bin/Release/SvtAv1EncApp] Error 1
+  # make[1]: *** [CMakeFiles/Makefile2:575: Source/App/CMakeFiles/SvtAv1EncApp.dir/all] Error 2
+  # make: *** [Makefile:136: all] Error 2
+  #
+  # libsvtav1 compile failed
+  # So quitting...
+
+
+  # for now - untill I figure out why this wont compile I'm skipping this
+  # personally I dont use it anyway
+  # echo -e "\n-------------------------------------------------------"
+  # echo -e "\nSkipping libsvtav1 untill compile error can be resolved"
+  # echo -e "\n-------------------------------------------------------"
+  # return
+
+
+  # FFCONFIG_ARGS="${FFCONFIG_ARGS} --enable-libsvtav1"
+  addFFConfigArgs --enable-libsvtav1
+  [ -z "${SIMULATE}" ] || return
+  echo -e "\nBuilding libsvtav1 ..."
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C SVT-AV1 pull 2> /dev/null || git clone https://gitlab.com/AOMediaCodec/SVT-AV1.git && \
+  mkdir -p SVT-AV1/build && \
+  cd SVT-AV1/build && \
+  SECONDS=0 && \
+  PATH="${ffmpeg_bin}:$PATH" cmake -G "Unix Makefiles" \
+      $CMFLAGS \
+      -DCMAKE_INSTALL_PREFIX="${ffmpeg_sources}" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_DEC=OFF \
+      -DBUILD_SHARED_LIBS=OFF \
+      "-DCMAKE_C_COMPILER=gcc-${GPP_VERSION}" \
+      "-DCMAKE_CXX_COMPILER=g++-${GPP_VERSION}" .. && \
+  PATH="${ffmpeg_bin}:$PATH" make $JM && \
+  make install && echo -e "\nDone\n" || bailout "libsvtav1 compile failed"
+  echo "Build took: $SECONDS seconds"
+}
+
+use_libsvtav1(){
+  # libsvtav1
+  #
+  # AV1 video encoder/decoder. Only the encoder is supported by FFmpeg, so building of the decoder is disabled.
+  #
+  # Requires ffmpeg to be configured with --enable-libsvtav1.
+
+  [ $# -gt 0 ] && [ "$1" == "retry" ] && echo -e "Re Trying libsvtav1 build after building and installing cpuinfo"
+
+  addFFConfigArgs --enable-libsvtav1
+  [ -z "${SIMULATE}" ] || return
+  printf "%0.s-" {1..60}
+  echo -e "\Cloning SVT-AV1 branch v2.3.0 to match ffmpeg branch release/7.0"
+  echo "at the time of writing:  ffmpeg master requires STV-AV1 >= 3.0.0"
+  echo "For STV-AV1 >= 3.0.0 you will have to use ffmpeg master "
+  echo "at the time of writing ffmpeg master is at has no version number but will be > 7.1"
+  echo "so consider fmpeg master to be the lastest snapshot and equivalent to"
+  echo "https://ffmpeg.org/releases/ffmpeg-snapshot.tar.bz2 as at 2025-06-03 19:27"
+  echo "If you modify this script to clone ffmpeg ffmpeg master you should also"
+  echo "modify this script to clone SVT-AV1 master"
+  echo "You can interperet my use of the word 'master' in all cases as branch 'HEAD'"
+  echo "for example clone to ffmpeg master:"
+  echo "git -C ffmpeg pull 2> /dev/null || git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg"
+  echo "To clone SVT-AV1 master:"
+  echo "git -C SVT-AV1 pull 2> /dev/null || git clone https://gitlab.com/AOMediaCodec/SVT-AV1.git"
+  printf "%0.s-" {1..60}
+  echo -e "\n"
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}"
+  # [ -d SVT-AV1 ] && cd SVT-AV1 && make clean && cd ..
+  git -C SVT-AV1 pull 2> /dev/null || git clone --depth 1 --branch v2.3.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
+  mkdir -p SVT-AV1/build && \
+  cd SVT-AV1/build && \
+  SECONDS=0 && \
+  # PATH="${ffmpeg_bin}:${ffmpeg_build}:$PATH" cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="${ffmpeg_sources}" -DCMAKE_BUILD_TYPE=Release -DBUILD_DEC=OFF -DBUILD_SHARED_LIBS=OFF .. && \
+  # PATH="${ffmpeg_bin}:${ffmpeg_build}:$PATH" make $JM && \
+  # PATH="${ffmpeg_bin}:$PATH" cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX="${ffmpeg_sources}" -DCMAKE_BUILD_TYPE=Release -DBUILD_DEC=OFF -DBUILD_SHARED_LIBS=OFF .. && \
+  PATH="${ffmpeg_bin}:$PATH" cmake -G "Unix Makefiles" \
+      $CMFLAGS  \
+      -DCMAKE_INSTALL_PREFIX="${ffmpeg_sources}" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_DEC=OFF \
+      -DBUILD_SHARED_LIBS=OFF \
+      "-DCMAKE_C_COMPILER=gcc-${GPP_VERSION}" \
+      "-DCMAKE_CXX_COMPILER=g++-${GPP_VERSION}" .. && \
+  PATH="${ffmpeg_bin}:$PATH" make $JM && \
+  make install
+  # if [ 1 -eq 0 ]; then
+  if [ $? -eq 0 ]; then
+    echo -en "\nDone\n"
+  else
+    beep_error
+    echo -en "\n\nTHERE WERE ERRORS!\n"
+    echo -e "If any of the last few lines of the error contained the text :"
+    echo -e "\n\t : undefined reference to 'cpuinfo_isa':\n"
+    echo -e "You may have to build and install cpuinfo.\n"
+    read -p "Shall I do this for you now [y/N] " ans
+    if [[ $ans =~ ^[Yy]$ ]]
+    then
+      tgtdir=${ffmpeg_sources}
+      lprefix="-DCMAKE_INSTALL_PREFIX=${tgtdir}"
+      beep
+      echo e "Shall I install cpuinfo system wide to /usr/local (requires sudo) or to ${tgtdir} (the default)"
+      read -p "Please choose S:System or L:Local| [s/L] " ans && [[ $ans =~ ^[Ss]$ ]] && lprefix=""
+      if [ "${lprefix}" == "" ]
+      then
+        echo -e "cpuinfo will be installed to /usr/local"
+        ssudo=sudo
+      else
+        echo -e "cpuinfo will be installed to $tgtdir"
+        echo -e "If compilation of ffmpeg fails after this, re-run and choose System"
+        unset ssudo
+      fi
+      cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+      git -C cpuinfo pull 2> /dev/null || git clone https://github.com/pytorch/cpuinfo.git && \
+      cd cpuinfo && \
+      cmake -DCMAKE_BUILD_TYPE=Release  "$lprefix" . && \
+      make && \
+      $ssudo make install
+      [ $? -ne 0 ] && bailout "cpuinfo compile failed"
+      checkPATH "$HOME/.local/bin"
+      LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
+      use_libsvtav1 "retry"
+    else
+      bailout "libsvtav1 compile failed"
+    fi
+  fi
+  echo "libsvtav1 Build took: $SECONDS seconds"
+  beep
+}
+
+
+
+use_libdav1d(){
+  # libdav1d
+  #
+  # AV1 decoder, much faster than the one provided by libaom.
+  #
+  # Requires ffmpeg to be configured with --enable-libdav1d.
+  #
+  addFFConfigArgs --enable-libdav1d
+  [ -z "${SIMULATE}" ] || return
+
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C dav1d pull 2> /dev/null || git clone  --depth 1 https://code.videolan.org/videolan/dav1d.git && \
+  mkdir -p dav1d/build && \
+  cd dav1d/build && \
+  SECONDS=0 && \
+  meson setup -Denable_tools=false -Denable_tests=false --default-library=static .. --prefix "${ffmpeg_sources}" --libdir="${ffmpeg_sources}/lib" && \
+  ninja $JM && \
+  ninja install && echo -e "\nDone\n" || bailout "libdav1d compile failed"
+  echo "libdav1d Build took: $SECONDS seconds"
+  beep
+}
+
+
+
+use_libvmaf(){
+  # libvmaf
+  # Library for calculating the ​VMAF video quality metric.
+  # Requires ffmpeg to be configured with --enable-libvmaf.
+  # Currently ​an issue in libvmaf also requires FFmpeg to be built with --ld="g++" for a static build to succeed.
+  #
+  addFFConfigArgs --enable-libvmaf
+  addFFConfigArgs --ld=$CXX # Currently ​an issue in libvmaf also requires FFmpeg to be
+                             # built with --ld="g++" for a static build to succeed.
+                             # https://github.com/Netflix/vmaf/issues/788
+  [ -z "${SIMULATE}" ] || return
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C vmaf-master pull 2> /dev/null || git clone  https://github.com/Netflix/vmaf.git vmaf-master && \
+  mkdir -p "vmaf-master/libvmaf/build" && \
+  cd "vmaf-master/libvmaf/build" && \
+  SECONDS=0
+  meson setup -Denable_tests=false -Denable_docs=false --buildtype=release --default-library=static .. \
+  --prefix "${ffmpeg_sources}" --bindir="${ffmpeg_sources}/bin" --libdir="${ffmpeg_sources}/lib" && \
+  ninja $JM && \
+  ninja install && echo -e "\nDone\n" || bailout "libvmaf compile failed"
+  echo "libvmaf Build took: $SECONDS seconds"
+  beep
+}
+
+
+
+BuildFFmpeg(){
+  # Show_Configure
+  NVCC="${CUDA_BINDIR}/nvcc"
+  if [ -f "${NVCC}" ]
+  then
+    nvcc --version || bailout "This build of ffmpeg requires NVCC which is not on the path"
+    checkPATH "${CUDA_BINDIR}"
+  else
+    bailout "This build of ffmpeg requires NVCC which is not on the path"
+  fi
+  g++ --version || bailout "This build of ffmpeg requires g++ which is not on the path"
+
+  # This is bogus BUT it has to happen because FFmpeg's configure script is
+  # globbing or concatenating the -ccbin and -gencode flags
+  #!/bin/bash
+  # addFFConfigArgs  --nvccflags="-ccbin=/usr/bin/g++-${GPP_VERSION} -gencode=arch=compute_52,code=sm_52"
+  echo "#!/bin/bash" > nvcc-wrapper
+  echo exec /usr/local/cuda/bin/nvcc -gencode=arch=compute_${NVGPU_GENCODE},code=sm_${NVGPU_GENCODE} "\$@" >> nvcc-wrapper
+  chmod +x nvcc-wrapper
+
+  addFFConfigArgs  --nvcc="${ffmpeg_build_root}/nvcc-wrapper"
+  addFFConfigArgs  --nvccflags="-ccbin=/usr/bin/g++-${GPP_VERSION}"
+  addFFConfigArgs  --enable-gnutls --enable-libass --enable-libfreetype
+  addFFConfigArgs  --enable-libmp3lame --enable-libvorbis
+  addFFConfigArgs  --cc=$CC --cxx=$CXX
+
+  # ffmpeg configure doesnt understand theseffmpeg configure doesnt understand these
+  # addFFConfigArgs  --disable-examples
+  # addFFConfigArgs  --disable-tests
+  # addFFConfigArgs  --disable-doc #speed things up
+  echo "checking pkg-config --modversion SvtAv1Enc"
+  pkg-config --modversion SvtAv1Enc || echo "But the PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+  echo "Information: pkg-config paths:"
+  pkg-config --variable pc_path pkg-config | tr ':' '\n' | xargs -I{} find {} -name "SvtAv1Enc.pc" 2>/dev/null
+  cd "${ffmpeg_sources}" || bailout "Failed to descend into ffmpeg_sources : ${ffmpeg_sources}" && \
+  git -C ffmpeg pull 2> /dev/null || git clone --branch release/7.0 --single-branch https://github.com/FFmpeg/FFmpeg.git ffmpeg
+  # for the latest commit
+  ba=$( echo -e "${FFCONFIG_ARGS}" | tr -s ' ' | sed 's/--/\\n\\t\\t--/g')"\n"
+  echo -e "build args :\n$ba"
+
+
+  SECONDS=0
+  echo -e "Working ..."
+  cd ffmpeg && \
+  PATH="${ffmpeg_bin}:$PATH" PKG_CONFIG_PATH="${ffmpeg_sources}/lib/pkgconfig" \
+        ./configure \
+        --prefix="${ffmpeg_build}" \
+        --pkg-config-flags="--static" \
+        --extra-cflags="-I${ffmpeg_build}/include" \
+        --extra-ldflags="-L${ffmpeg_build}/lib" \
+        --extra-libs="-lpthread -lm" \
+        --enable-pic \
+        --bindir="${ffmpeg_bin}" \
+        --logfile="${ffmpeg_build_root}/ffmpeg_config.log" \
+        ${FFCONFIG_ARGS} && \
+    PATH="$HOME/bin:$PATH" make
+    make_status=$?
+    if [ $make_status -eq 0 ]; then
+        # Only run make install if something was built or updated
+        # (Optional: you can always run make install, it's usually fast if nothing changed)
+        make install && hash -r && echo -e "\nDone\n"
+    else
+        bailout "ffmpeg compile failed"
+    fi
+        # make install && \
+        # hash -r && echo -e "\nDone\n" || bailout "ffmpeg compile failed"
+      echo "ffmpeg Build took: $SECONDS seconds"
+      beep success
+    }
+
+
+ShowFFmpeg(){
+  if [ -f ${ffmpeg_bin}/ffmpeg ]
+  then
+    for i in encoders decoders filters
+    do
+        ${ffmpeg_bin}/ffmpeg -hide_banner -${i}
+    done
+  else
+    echo "${ffmpeg_bin}/ffmpeg not found"
+  fi
+}
+
+select_action(){ # quick and dirty prompting for Yes No Cancel
+
+  SEL_ACTION=""
+  ync=" [Y]es [N]no [C]ancel "
+  choice="n"
+  _default="n"
+# select_action "test the menu" test_menu1 h batchelor
+#check our args are acceptable
+  i=1
+  _error=""
+  for arg in "$@"; do
+    # echo $arg
+    case "$i" in
+      1 ) # message
+        _prompt=$arg
+        ;;
+      2 ) # action
+        if type "$arg" &>/dev/null; then
+          _action=$arg
+        else
+          bailout "ERROR: select_action for $_prompt:\n\"$arg\" is not a function."
+        fi
+        ;;
+      3 ) # default
+        case "${arg}" in
+          Y|N|C|y|n|c)
+            _default=${arg^^}
+            ;;
+          *)
+            bailout "ERROR: select_action for $_prompt:\nExpected one of (Y|y|N|n|C|c) but \"$arg\" was given."
+            ;;
+        esac
+        ;;
+      4 ) # batch
+        if [ "${arg,,}" == "batch" ]
+        then
+          batch='batch'
+          choice=$_default
+        else
+          bailout "ERROR: select_action for $_prompt:\nThe optional \"batch\" argument should contain the word \"batch\" but \"$arg\" was given."
+        fi
+        ;;
+      * )
+         bailout "ERROR: select_action for $_prompt:\nUnknown or unexpected number of arguments: $@"
+        ;;
+    esac
+    i=$((i+1))
+  done
+
+
+fin=1
+while [ "${fin}" -eq 1 ]
+do
+      echo ""
+      if [ "${batch}" == "batch" ]
+      then
+        # echo -e "${ync} [${_default}]\n"
+        echo "Do you wish to $_prompt? ${ync} [${_default}]"
+        choice=${_default,,}
+      else
+        read -r -p "Do you wish to $_prompt? ${ync} [${_default}]" choice
+        [ "${choice,,}" = ""  ] && choice=${_default,,}
+      fi
+
+      SEL_ACTION=${choice^^}
+      # echo " "
+      # if [[ $ans =~ ^[Yy]$ ]]
+      # if [ "$choice" = "y" ]; then
+      if [[ $choice =~ ^[Yy]$ ]]; then
+        $_action
+        fin=0
+      elif [[ $choice =~ ^[Nn]$ ]]; then
+        echo "$_prompt - skipped!"
+        fin=0
+      elif [[ $choice =~ ^[Cc]$ ]];then
+        echo "Latest FFmpeg Private Build and Installation cancelled"
+        fin=0
+        exit
+      else
+        echo "Invalid response!"
+      fi
+ done
+}
+
+
+main(){
+  # any argument passed in here will be assumed to mean run as a batch without prompting
+  [ $# -gt 0 ] && batch='batch' || unset batch
+  # the following moved to pre_main before asking user about batch
+  # echo -e "Install dependancies for this build?\nNote that I reccommend you dont do this repeatedly"
+  # echo -e " Best only to do this the first time and skip for repeats"
+  # select_action "Install Dependencies for FFmpeg (requires sudo)" deps N # LET THE USER SKIP THIS${batch}
+  Show_Configure
+  select_action "Build latest version of nasm (private build)" assembler y ${batch}
+  select_action "compile ffmpeg with ffnvcodec (sudo)" use_ffnvcodec y ${batch}
+  select_action "compile ffmpeg with libx264" use_libx264 y ${batch}
+  select_action "compile ffmpeg with libx265" use_libx265 y ${batch}
+  select_action "compile ffmpeg with libvpx" use_libvpx y ${batch}
+  select_action "compile ffmpeg with libfdk_aac" use_libfdk_aac y ${batch}
+  select_action "compile ffmpeg with libopus" use_libopus y ${batch}
+  select_action "compile ffmpeg with libaom" use_libaom y ${batch}
+  select_action "compile ffmpeg with libsvtav1" use_libsvtav1 y ${batch}
+  select_action "compile ffmpeg with libdav1d" use_libdav1d y ${batch}
+  select_action "compile ffmpeg with libvmaf" use_libvmaf y ${batch}
+  select_action "Build FFmpeg" BuildFFmpeg y ${batch}
+  # select_action "Check out what this version of ffmpeg can do" ShowFFmpeg n # ${batch}
+  show_exec_time
+  beep
+}
+
+pre_main(){
+  Do_Configure
+  # Show_Configure
+  if [[ -d ${ffmpeg_sources} ]] || [[ -d ${ffmpeg_build} ]] #|| [[ -f ${ffmpeg_bin}/nasm ]]
+  then
+    [ -z "${SIMULATE}" ] && select_action "Clean up the source build area (start from scratch)?" cleanup N
+  fi
+
+  select_action "Get sudo ready so you dont get any interruptions" set_sudo y
+
+  echo -e "Install dependancies for this build?\nNote that I reccommend you dont do this repeatedly"
+  echo -e " Best only to do this the first time and skip for repeats"
+  select_action "Install Dependencies for FFmpeg (requires sudo)" deps N # LET THE USER SKIP THIS${batch}
+
+  if [[ -d ${ffmpeg_sources} ]] && [[ -d ${ffmpeg_build} ]] && [[ -f ${ffmpeg_bin}/nasm ]]
+  then
+    select_action "Only re-compile ffmpeg" Simulate n
+    # if [ "${SEL_ACTION}" == "Y" ]
+    if [[ $SEL_ACTION =~ ^[Yy]$ ]]
+    then
+      main "batch"
+      return
+    fi
+  else
+    mkdirs
+  fi
+  ync=" [Y]es [N]no [C]ancel [N]"
+  choice=""
+  done=1
+  while [ ${done} -eq 1 ]
+  do
+        echo -e "\nShall I prompt for each section? (exept cleanup)"
+        # echo -e "\nIf you choose [N]o all sections will run without further prompting"
+        read -r -p "If you choose [N]o all sections will run without further prompting. ${ync} " choice
+        [ "${choice,,}" = "" ] && choice=n
+        choice=${choice,,}
+        echo -e " ${choice} \n"
+        if [ "$choice" = "y" ]; then
+          main
+          done=0
+        elif [ "$choice" = "n" ];then
+          echo -e "\nAll actions continuing without further user input"
+          echo -e "\nBatch will end on the first unsuccesful compilation\n"
+          echo -e "\n_____________________________________________________\n"
+          main "batch"
+          done=0
+        elif [ "$choice" = "c" ];then
+          echo "Latest FFmpeg Private Installation cancelled"
+          done=0
+          return
+        else
+          echo "Invalid response!"
+        fi
+  done
+}
+
+test_menu(){
+  echo "menu test"
+  echo "selected action : ${SEL_ACTION}"
+}
+
+
+Simulate(){
+  SIMULATE='True'
+}
+
+echo "--------------------------------------------------"
+echo -e "Private version of FFmpeg"
+echo -e "This process will prepare and compile sources in:\n\t${ffmpeg_sources}\n"
+echo -e "This process will use the build folder :\n\t${ffmpeg_build}\n"
+echo -e "Binary executables will be placed in:\n\t${ffmpeg_bin}\n"
+echo -e "This script will output sound on success and a different sound on failue\n"
+select_action "Disable sounds" set_quiet N
+beep # should hear nothing if user disabled
+
+
+# comment out the next one for testing individual sections
+pre_main
+# like any of these:
+# Do_Configure && select_action "use_libaom" use_libaom y
+# Do_Configure && select_action "Build latest version of nasm (private build)" assembler y
+# show_exec_time
+exit 0
