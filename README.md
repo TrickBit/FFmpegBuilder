@@ -10,7 +10,7 @@ It is well commented and includes some the associated wiki texts.
 I hope the folks at ffmpeg dont mind :) 
 I've also included comments about any gotchas I encountered and how I overcame them, if I did and appropriate comments to show what I havent overcome yet.
 
-I've targeted this specifically and nvidia gpus for on chip and ultimateley faster encoding and transcoding
+I've targeted this specifically at building ffmpeg with support for hardware acceleration, primarily for nvidia gpus/
 This was my sole purpose for building this script 
 It is a bit tricky getting the toolchain alignment resolved for NVidia things.
 FFmpeg + CUDA + AV1 stack can be finicky about it.
