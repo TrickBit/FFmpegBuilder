@@ -11,8 +11,14 @@ I hope the folks at ffmpeg dont mind :)
 I've also included comments about any gotchas I encountered and how I overcame them, if I did and appropriate comments to show what I havent overcome yet.
 
 I've targeted this specifically and nvidia gpus for on chip and ultimateley faster encoding and transcoding
-This was my sole purpose for building this script BUT you can choose not to do 
-the cuda and nvidia stuff and all will still work - maybe - there might be some things in the configuration function to comment out
+This was my sole purpose for building this script 
+It is a bit tricky getting the toolchain alignment resolved for NVidia things.
+FFmpeg + CUDA + AV1 stack can be finicky about it.
+
+You can choose not to do the cuda and nvidia stuff and all will still work 
+    - maybe 
+    - there might be some things in the configuration function to comment out
+    
 If there is I can maybe make it optional - down the track - let me know - or even contribute.
 
 You should read the code in one window and have the wiki page open in another if you want to check its accuracy. 
